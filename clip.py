@@ -10,19 +10,17 @@ from transformers import CLIPProcessor, CLIPModel
 from tqdm import tqdm
 
 # --- SFTP Configuration ---
-SFTP_HOST = "ftp.itec.aau.at"
+SFTP_HOST = os.getenv('host')
 SFTP_PORT = 22
-SFTP_USERNAME = "v3c"
-SFTP_PASSWORD = "qpG/mRV1N8YY"
+SFTP_USERNAME = os.getenv('username')
+SFTP_PASSWORD = os.getenv('password')
 REMOTE_TGZ_PATH = "V3C1/keyframes"
-
-FAILED_TGZ_FILENAME = "06466.tgz"
 
 # --- Output Config ---
 OUTPUT_EMBEDDINGS_DIR = 'clip_embeddings'
 
 # --- Config for resume ---
-START_FROM_FILE = '07200.tgz'
+START_FROM_FILE = '07200.tgz' # None to start from begaining.
 
 # ---- Helper Functions (from your main script) ----
 def extract_tgz(tgz_path, extract_dir):
