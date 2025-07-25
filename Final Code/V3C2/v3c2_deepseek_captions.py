@@ -1,100 +1,111 @@
 import os
-import json
-import atexit
-from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM
-from deepseek_vl2.models import DeepseekVLV2Processor
+from deepseek_vl2.models import DeepseekVLV2Processor, DeepseekVLV2ForCausalLM
 from deepseek_vl2.utils.io import load_pil_images
-from concurrent.futures import ThreadPoolExecutor
 from codecarbon import EmissionsTracker
+import logging
+from codecarbon.output import LoggerOutput
 
-# === Configuration ===
-INPUT_FOLDER_DIR = "/media/irlab/890bd749-cf2c-4f59-95fa-25153d050c89/Viraj/AVS/Dataset"
-OUTPUT_DIR = "./vl2_captions"
-CHECKPOINT_FILE = "./checkpoint.json"
-MODEL_ID = "deepseek-ai/deepseek-vl2-tiny"
-PROMPT = "<|User|>\n<image>\n"
-BATCH_SIZE = 4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ---- Paths ---- #
+root_image_dir = "./root_images"        # Root directory with subfolders
+output_dir = "./captions"               # Where captions will be saved
+processed_log_path = "processed_files_v3c2.txt"
+os.makedirs(output_dir, exist_ok=True)
 
-# Setup
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-processed = set(json.load(open(CHECKPOINT_FILE)) if Path(CHECKPOINT_FILE).exists() else [])
+# ---- Setup Carbon Emissions Tracker ---- #
+logger = logging.getLogger("carbon_logger")
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger_output = LoggerOutput(logger=logger)
 
-# Load model & processor
-processor = DeepseekVLV2Processor.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(DEVICE).eval()
-
-# Track emissions for the whole run
-tracker = EmissionsTracker(project_name="vl2_captioning", measure_power_secs=60)
+tracker = EmissionsTracker(
+    project_name="v3c2",
+    output_file="emissions_v3c2.csv",
+    logging_logger=logger_output
+)
 tracker.start()
 
-def save_checkpoint():
-    tmp = CHECKPOINT_FILE + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(list(processed), f)
-    os.replace(tmp, CHECKPOINT_FILE)
+# ---- Load Model and Processor ---- #
+model_path = "deepseek-ai/deepseek-vl2-tiny"
+vl_chat_processor: DeepseekVLV2Processor = DeepseekVLV2Processor.from_pretrained(model_path)
+tokenizer = vl_chat_processor.tokenizer
 
-def shutdown_handler():
-    emissions = tracker.stop()
-    print(f"\n📊 Total CO₂ emissions this session: {emissions:.4f} kg")
-atexit.register(shutdown_handler)
+vl_gpt: DeepseekVLV2ForCausalLM = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+vl_gpt = vl_gpt.to(torch.bfloat16).cuda().eval()
 
-def process_batch(image_paths, folder_name):
-    out_dir = Path(OUTPUT_DIR) / folder_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+# ---- Load Already Processed ---- #
+if os.path.exists(processed_log_path):
+    with open(processed_log_path, "r") as f:
+        processed_files = set(line.strip() for line in f)
+else:
+    processed_files = set()
 
-    try:
-        # Prepare conversations
-        conversations = []
-        for img in image_paths:
-            conversations += [
-                {"role": "<|User|>", "content": PROMPT, "images": [img]},
-                {"role": "<|Assistant|>", "content": ""}
+# ---- Process All Images in Subfolders ---- #
+supported_exts = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+for dirpath, _, filenames in os.walk(root_image_dir):
+    for filename in sorted(filenames):
+        if not filename.lower().endswith(supported_exts):
+            continue
+
+        full_image_path = os.path.join(dirpath, filename)
+        base_filename = os.path.splitext(filename)[0]
+        txt_output_path = os.path.join(output_dir, f"{base_filename}.txt")
+
+        if base_filename in processed_files:
+            continue
+
+        print(f"🖼️ Captioning: {full_image_path}")
+
+        try:
+            # Create conversation format
+            conversation = [
+                {
+                    "role": "<|User|>",
+                    "content": "<image>\n<|ref|>Describe the image.<|/ref|>.",
+                    "images": [full_image_path],
+                },
+                {"role": "<|Assistant|>", "content": ""},
             ]
-        pil_images = load_pil_images(conversations)
-        inputs = processor(conversations=conversations, images=pil_images, force_batchify=True, system_prompt="").to(DEVICE)
 
-        inputs_embeds = model.prepare_inputs_embeds(**inputs)
-        outputs = model.language_model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=inputs.attention_mask,
-            max_new_tokens=64,
-            pad_token_id=processor.tokenizer.eos_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id
-        )
+            pil_images = load_pil_images(conversation)
+            prepare_inputs = vl_chat_processor(
+                conversations=conversation,
+                images=pil_images,
+                force_batchify=True,
+                system_prompt=""
+            ).to(vl_gpt.device)
 
-        # Write captions
-        idx = 0
-        for img_path in image_paths:
-            cap = processor.tokenizer.decode(outputs[idx].cpu(), skip_special_tokens=True).strip()
-            idx += 1
-            stem = Path(img_path).stem
-            with open(out_dir / f"{stem}.txt", "w", encoding="utf-8") as f:
-                f.write(cap)
-            processed.add(str(img_path))
+            inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
 
-        save_checkpoint()
+            # Generate caption
+            with torch.no_grad():
+                outputs = vl_gpt.generate(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=prepare_inputs.attention_mask,
+                    pad_token_id=tokenizer.eos_token_id,
+                    bos_token_id=tokenizer.bos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=512,
+                    do_sample=False,
+                    use_cache=True
+                )
 
-    except Exception as e:
-        print(f"⚠️ Batch error on {folder_name}: {e}")
-        save_checkpoint()
+            answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
 
-def process_folder(folder_path):
-    folder = Path(folder_path).name
-    img_list = [
-        str(p) for p in Path(folder_path).rglob("*")
-        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} and str(p) not in processed
-    ]
-    for i in range(0, len(img_list), BATCH_SIZE):
-        process_batch(img_list[i:i+BATCH_SIZE], folder)
+            # Save caption
+            with open(txt_output_path, "w", encoding="utf-8") as f:
+                f.write(answer.strip())
 
-if __name__ == "__main__":
-    print(f"Device: {DEVICE}, Model: {MODEL_ID}, Batch size: {BATCH_SIZE}")
-    folders = [p for p in Path(INPUT_FOLDER_DIR).iterdir() if p.is_dir()]
-    with ThreadPoolExecutor(max_workers=4) as exe:
-        exe.map(process_folder, folders)
-    # Emissions printed on exit via atexit
-    print("✅ Caption generation complete!")
+            # Update log
+            with open(processed_log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"{base_filename}\n")
+            processed_files.add(base_filename)
 
+        except Exception as e:
+            print(f"❌ Failed to caption {filename}: {e}")
+
+# ---- Final Emissions ---- #
+emissions = tracker.stop()
+print(f"\n🌍 Total CO₂ emissions: {emissions:.6f} kg")
+print("📄 Emissions log saved to: emissions_v3c2.csv")
